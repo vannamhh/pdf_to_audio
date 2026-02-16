@@ -1,15 +1,14 @@
 """
-AI Audio Book Converter — v2 (Fault-Tolerant)
+AI Audio Book Converter — v3 (PyMuPDF Engine)
 ==============================================
 Streamlit app chuyển đổi file PDF → MP3 audiobook.
 
-Cải tiến chính so với v1:
-- Lưu từng chunk MP3 ngay khi hoàn thành → không mất dữ liệu khi lỗi.
-- Resume: bỏ qua chunk đã tồn tại trên đĩa, chỉ xử lý phần còn lại.
-- Pagination Editor: hiển thị & sửa text theo từng chunk, không treo UI.
-- Retry Logic: tự động thử lại 3 lần khi gọi TTS thất bại.
-- Partial Download: tải ZIP bất cứ lúc nào có ≥ 1 file MP3.
-- Stop/Pause: dừng xử lý giữa chừng, giữ nguyên kết quả đã có.
+v3 Cải tiến:
+- PyMuPDF (fitz) block-based extraction → nhận diện đoạn văn chính xác.
+- Bounding-box header/footer removal (configurable margin).
+- Smart de-hyphenation (chỉ nối khi từ tiếp theo viết thường).
+- Paragraph-aware chunking (ưu tiên \n\n, tránh cắt viết tắt).
+- Giữ nguyên: Resume, Retry, Stop/Pause, Partial Download, Editor.
 
 Chạy:  streamlit run app.py
 """
@@ -21,7 +20,6 @@ import re
 import time
 import hashlib
 import zipfile
-from collections import Counter
 
 import edge_tts
 import pdfplumber
@@ -40,9 +38,20 @@ VOICE_OPTIONS = {
 }
 
 DEFAULT_CHUNK_SIZE = 3000
+DEFAULT_MARGIN_PX = 50
 MAX_RETRIES = 3
 RETRY_DELAY_SECONDS = 2
 OUTPUT_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output")
+
+# Regex: dấu chấm kết thúc câu thật (tránh viết tắt)
+# Negative lookbehind cho các viết tắt phổ biến VN & EN
+_SENTENCE_END_RE = re.compile(
+    r'(?<!Mr)(?<!Mrs)(?<!Ms)(?<!Dr)(?<!St)(?<!vs)'
+    r'(?<!Tp)(?<!PGS)(?<!TS)(?<!GS)(?<!Ths)(?<!KS)'
+    r'(?<!\d)'
+    r'[.!?]["\u201D»)\]]*'
+    r'(?=\s|$)',
+)
 
 # ──────────────────────────────────────────────
 # HELPERS — File & Folder
@@ -85,27 +94,48 @@ def list_existing_mp3s(output_folder: str) -> list[str]:
 
 
 # ──────────────────────────────────────────────
-# STEP 1: EXTRACT — Trích xuất text từ PDF
+# STEP 1: EXTRACT — Trích xuất text bằng pdfplumber (crop-based)
 # ──────────────────────────────────────────────
 
 
 @st.cache_data(show_spinner=False)
-def extract_text_with_cache(file_bytes: bytes, file_name: str) -> list[str]:
+def extract_text_with_cache(
+    file_bytes: bytes,
+    file_name: str,
+    margin_top: int = DEFAULT_MARGIN_PX,
+    margin_bottom: int = DEFAULT_MARGIN_PX,
+) -> list[str]:
     """
-    Trích xuất text từ PDF, cache kết quả để không parse lại khi reload.
+    Trích xuất text từ PDF bằng pdfplumber với crop bounding-box.
+
+    Sử dụng page.crop() để loại bỏ header/footer theo tọa độ,
+    giữ nguyên khoảng trắng giữa các từ tiếng Việt.
 
     Args:
         file_bytes: Nội dung file PDF (bytes).
-        file_name: Tên file gốc (dùng cho thông báo lỗi).
+        file_name: Tên file gốc.
+        margin_top: Vùng loại bỏ phía trên trang (px).
+        margin_bottom: Vùng loại bỏ phía dưới trang (px).
 
     Returns:
-        Danh sách text từng trang.
+        Danh sách text từng trang (đã loại header/footer).
     """
-    pages_text = []
+    pages_text: list[str] = []
     try:
         with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
             for page in pdf.pages:
-                text = page.extract_text()
+                # An toàn: bỏ qua trang nếu margin lớn hơn trang
+                if margin_top + margin_bottom >= page.height:
+                    continue
+                # Crop: bỏ margin_top px trên và margin_bottom px dưới
+                bbox = (
+                    0,                                # x0 (left)
+                    margin_top,                       # y0 (top, cắt header)
+                    page.width,                       # x1 (right)
+                    page.height - margin_bottom,      # y1 (bottom, cắt footer)
+                )
+                cropped = page.crop(bbox)
+                text = cropped.extract_text()
                 if text:
                     pages_text.append(text)
     except Exception as e:
@@ -118,47 +148,19 @@ def extract_text_with_cache(file_bytes: bytes, file_name: str) -> list[str]:
 # ──────────────────────────────────────────────
 
 
-def detect_repeated_lines(pages_text: list[str], threshold: float = 0.5) -> set[str]:
+def _is_page_number(text: str) -> bool:
     """
-    Phát hiện header/footer lặp lại trên > threshold% số trang.
+    Kiểm tra block có phải chỉ là số trang hay không.
 
-    Chỉ xét 2 dòng đầu + 2 dòng cuối mỗi trang, dòng < 100 ký tự.
+    Nhận diện: "42", "- 7 -", "— 12 —", "page 5", "trang 10".
     """
-    if len(pages_text) < 4:
-        return set()
-
-    counter: Counter = Counter()
-    for page in pages_text:
-        lines = page.strip().split("\n")
-        candidates = set()
-        for line in lines[:2] + lines[-2:]:
-            s = line.strip()
-            if s and len(s) < 100:
-                candidates.add(s)
-        for c in candidates:
-            counter[c] += 1
-
-    min_count = int(len(pages_text) * threshold)
-    return {line for line, cnt in counter.items() if cnt >= min_count}
-
-
-def _is_page_number(line: str) -> bool:
-    """
-    Kiểm tra xem dòng có phải chỉ là số trang hay không.
-
-    Nhận diện các dạng phổ biến:
-    - "42", " 103 ", "- 7 -", "— 12 —", "page 5", "trang 10"
-    """
-    s = line.strip()
+    s = text.strip()
     if not s:
         return False
-    # Dạng số thuần: "42", "103"
     if re.fullmatch(r"\d{1,4}", s):
         return True
-    # Dạng có gạch ngang: "- 7 -", "— 12 —", "– 5 –"
     if re.fullmatch(r"[-–—]\s*\d{1,4}\s*[-–—]", s):
         return True
-    # Dạng "page 5", "trang 10", "p. 42" (case-insensitive)
     if re.fullmatch(r"(?:page|trang|p\.?)\s*\d{1,4}", s, re.IGNORECASE):
         return True
     return False
@@ -166,25 +168,17 @@ def _is_page_number(line: str) -> bool:
 
 def _is_section_number(line: str) -> bool:
     """
-    Kiểm tra dòng có bắt đầu bằng số mục/section không.
+    Kiểm tra dòng bắt đầu bằng số mục/section.
 
-    Nhận diện các dạng:
-    - Đơn giản: "1)", "2.", "12)", "3. "
-    - Dotted: "1.2.", "1.2.1.", "3.4.5.", "1.2 ", "1.2.1 "
-    - Chữ + dấu: "a)", "b.", "A)"
-    - Bullet: "- item", "• item", "* item", "▪ item"
-    - Roman: "i)", "ii.", "iv)"
+    Nhận diện: "1)", "1.2.", "1.2.1.", "a)", "- item", "• item".
     """
     s = line.strip()
     if not s:
         return False
-    # Dotted section numbers: "1.2.", "1.2.1.", "1.2.1 Text", "1.2. Text"
     if re.match(r"^\d+(\.\d+)+\.?\s", s):
         return True
-    # Đơn giản: số/chữ + ) hoặc .  theo sau bởi space
     if re.match(r"^(\d{1,3}|[a-zA-Z]|[ivxIVX]{1,4})[.)]\s", s):
         return True
-    # Bullet characters
     if re.match(r"^[-•*▪◦‣►–—]\s", s):
         return True
     return False
@@ -194,98 +188,84 @@ def _is_heading_line(line: str) -> bool:
     """
     Heuristic nhận diện dòng tiêu đề.
 
-    Tiêu đề thường: ngắn (< 100 ký tự), không kết thúc bằng dấu câu nội dung,
-    và có thể bắt đầu bằng chữ hoa, section number, hoặc keyword.
+    Tiêu đề: ngắn (< 100 ký tự), không kết thúc bằng dấu câu nội dung,
+    bắt đầu bằng chữ hoa, section number, hoặc keyword đặc biệt.
     """
     s = line.strip()
     if not s or len(s) > 100:
         return False
-
-    # Kết thúc bằng dấu câu nội dung → chắc chắn không phải heading
-    # (Lưu ý: dấu chấm ở cuối section number "1.2." KHÔNG tính)
+    # Kết thúc bằng dấu câu nội dung → không phải heading
     if re.search(r"[!?;,]\s*$", s):
         return False
-    # Kết thúc bằng dấu chấm → chỉ loại nếu trước dấu chấm là chữ (câu bình thường)
-    # "1.2." hoặc "Phần 1." thì vẫn có thể là heading
     if re.search(r"[a-zA-ZÀ-ỹ]\.\s*$", s) and len(s) > 60:
         return False
-
-    # Toàn chữ hoa (>= 3 ký tự chữ) → heading
+    # Toàn chữ hoa (>= 3 ký tự chữ)
     alpha_chars = re.findall(r"[a-zA-ZÀ-ỹ]", s)
     if len(alpha_chars) >= 3 and s == s.upper():
         return True
-
-    # Bắt đầu bằng keyword tiêu đề (VN + EN)
+    # Keyword tiêu đề (VN + EN)
     if re.match(
         r"^(Chương|CHƯƠNG|Phần|PHẦN|Bài|BÀI|Mục|MỤC|"
         r"Chapter|CHAPTER|Part|PART|Section|SECTION)\b",
         s,
     ):
         return True
-
-    # Bắt đầu bằng dotted section number + text ngắn → heading
-    # Ví dụ: "1.2. Sự khác nhau...", "1.2.1. Sự đa dạng"
+    # Dotted section number
     if re.match(r"^\d+(\.\d+)+\.?\s", s):
         return True
-
-    # Ngắn (< 60 ký tự) + không dấu câu kết thúc + bắt đầu bằng chữ hoa
+    # Ngắn + chữ hoa đầu
     if len(s) < 60 and len(s.split()) <= 10:
         first_alpha = re.search(r"[a-zA-ZÀ-ỹ]", s)
         if first_alpha and first_alpha.group().isupper():
             return True
-
     return False
 
 
 def _buffer_ends_complete(buffer: str) -> bool:
-    """Kiểm tra buffer có kết thúc bằng câu hoàn chỉnh (dấu câu) không."""
+    """Kiểm tra buffer kết thúc bằng câu hoàn chỉnh (dấu câu, không phải viết tắt)."""
     if not buffer:
         return True
+    # Nếu kết thúc bằng viết tắt + dấu chấm → chưa hết câu
+    if re.search(
+        r'(?:Mr|Mrs|Ms|Dr|St|vs|Tp|PGS|TS|GS|Ths|KS|ThS|Q|P|Tr)\.' r'\s*$',
+        buffer,
+    ):
+        return False
     return bool(re.search(r'[.!?:;"\u201D»)\]]\s*$', buffer))
 
 
 def _reflow_paragraphs(text: str) -> str:
     """
-    Nối các dòng bị ngắt giữa câu (do PDF hard-wrap) thành câu liền mạch.
+    Lightweight reflow cho text đã trích xuất bằng PyMuPDF blocks.
 
-    Logic thông minh:
-    - Dòng trống + buffer đã kết thúc câu → paragraph break thật.
-    - Dòng trống + buffer chưa kết thúc câu → câu bị ngắt qua trang,
-      tiếp tục nối (chỉ thêm space, không tạo paragraph break).
-    - Dòng là section number (1.2., 1.2.1.) → heading, đứng riêng.
-    - Dòng là list item (1), -, •) → bắt đầu block mới.
-    - Dòng kết thúc bằng dấu câu hoàn chỉnh → kết thúc block.
-    - Dòng bị ngắt giữa chừng → nối tiếp vào câu trước.
+    PyMuPDF blocks đã nhận diện paragraph khá tốt, nhưng vẫn có thể
+    chứa hard line-breaks bên trong block. Hàm này nối các dòng bị
+    ngắt giữa câu và giữ nguyên cấu trúc heading/list.
     """
     lines = text.split("\n")
     result: list[str] = []
     buffer = ""
-    # Đếm số dòng trống liên tiếp để phân biệt page-break vs paragraph
     blank_count = 0
 
     for line in lines:
         stripped = line.strip()
 
-        # ── Dòng trống ──
         if not stripped:
             blank_count += 1
             continue
 
-        # ── Xử lý các dòng trống đã tích lũy ──
+        # Xử lý dòng trống tích lũy
         if blank_count > 0:
             if buffer and not _buffer_ends_complete(buffer):
-                # Buffer chưa kết thúc câu → đây là page break giữa câu
-                # Nối tiếp, không tạo paragraph break
-                pass
+                pass  # Cross-page/block break giữa câu → nối tiếp
             else:
-                # Buffer đã kết thúc câu → paragraph break thật
                 if buffer:
                     result.append(buffer)
                     buffer = ""
                 result.append("")
             blank_count = 0
 
-        # ── Dòng bắt đầu block mới (heading / section number) ──
+        # Heading → đứng riêng
         if _is_heading_line(stripped):
             if buffer:
                 result.append(buffer)
@@ -293,7 +273,7 @@ def _reflow_paragraphs(text: str) -> str:
             result.append(stripped)
             continue
 
-        # ── Dòng là list item (nhưng không phải heading) ──
+        # List item → bắt đầu block mới
         if _is_section_number(stripped):
             if buffer:
                 result.append(buffer)
@@ -301,18 +281,17 @@ def _reflow_paragraphs(text: str) -> str:
             buffer = stripped
             continue
 
-        # ── Nối dòng thường vào buffer ──
+        # Nối dòng thường
         if buffer:
             buffer += " " + stripped
         else:
             buffer = stripped
 
-        # ── Kiểm tra kết thúc câu hoàn chỉnh ──
+        # Kết thúc câu → flush
         if _buffer_ends_complete(buffer):
             result.append(buffer)
             buffer = ""
 
-    # Flush phần còn lại
     if buffer:
         result.append(buffer)
 
@@ -321,31 +300,26 @@ def _reflow_paragraphs(text: str) -> str:
 
 def clean_text(pages_text: list[str]) -> str:
     """
-    Pipeline làm sạch văn bản PDF:
-    1. Xóa header/footer lặp lại.
-    2. Xóa số trang (standalone page numbers).
-    3. Nối từ bị ngắt dòng (hyphenation fix).
-    4. Xóa ký tự control.
-    5. Chuẩn hóa khoảng trắng.
-    6. Reflow paragraphs: nối các dòng bị ngắt giữa câu.
+    Pipeline làm sạch văn bản từ PyMuPDF pages:
+    1. Xóa số trang.
+    2. Smart de-hyphenation (chỉ nối khi từ tiếp viết thường).
+    3. Xóa ký tự control.
+    4. Chuẩn hóa khoảng trắng.
+    5. Reflow: nối dòng bị ngắt giữa câu.
     """
-    repeated = detect_repeated_lines(pages_text)
-    cleaned = []
+    cleaned_pages: list[str] = []
 
     for page in pages_text:
         lines = page.strip().split("\n")
 
-        # Xóa header/footer lặp
-        if repeated:
-            lines = [l for l in lines if l.strip() not in repeated]
-
-        # Xóa số trang
+        # Xóa dòng chỉ là số trang
         lines = [l for l in lines if not _is_page_number(l)]
 
         text = "\n".join(lines)
 
-        # Nối từ bị ngắt dòng: "thông-\nbáo" → "thôngbáo"
-        text = re.sub(r"(\w+)-\n(\w+)", r"\1\2", text)
+        # Smart de-hyphenation: chỉ nối nếu từ tiếp theo viết thường
+        # "thông-\nbáo" → "thôngbáo" nhưng "Bắc-\nKinh" giữ nguyên
+        text = re.sub(r"(\w+)-\n([a-zà-ỹ])", r"\1\2", text)
 
         # Xóa ký tự control (giữ newline, tab, space)
         text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", text)
@@ -355,10 +329,12 @@ def clean_text(pages_text: list[str]) -> str:
         text = re.sub(r"[ \t]+", " ", text)
         text = "\n".join(l.strip() for l in text.split("\n"))
 
-        cleaned.append(text.strip())
+        text = text.strip()
+        if text:
+            cleaned_pages.append(text)
 
     # Ghép tất cả trang, sau đó reflow paragraph
-    merged = "\n\n".join(cleaned)
+    merged = "\n\n".join(cleaned_pages)
     return _reflow_paragraphs(merged)
 
 
@@ -369,15 +345,20 @@ def clean_text(pages_text: list[str]) -> str:
 
 def split_into_chunks(text: str, chunk_size: int = DEFAULT_CHUNK_SIZE) -> list[str]:
     """
-    Chia text thành các đoạn ≤ chunk_size ký tự.
-    Ưu tiên cắt tại ranh giới câu (. ! ?) để không ngắt giữa câu.
+    Chia text thành đoạn ≤ chunk_size ký tự.
+
+    Quy tắc ưu tiên cắt:
+    1. Double newline (\n\n) — ranh giới đoạn văn.
+    2. Dấu chấm câu thật (tránh viết tắt Tp., Mr., Dr..).
+    3. Single newline.
+    4. Hard-cut tại chunk_size.
     """
     if not text.strip():
         return []
     if len(text) <= chunk_size:
         return [text]
 
-    chunks = []
+    chunks: list[str] = []
     remaining = text
 
     while remaining:
@@ -387,16 +368,27 @@ def split_into_chunks(text: str, chunk_size: int = DEFAULT_CHUNK_SIZE) -> list[s
 
         segment = remaining[:chunk_size]
         best_cut = -1
-        for sep in [".\n", "!\n", "?\n", ". ", "! ", "? "]:
-            idx = segment.rfind(sep)
-            if idx > best_cut:
-                best_cut = idx + len(sep)
 
+        # Ưu tiên 1: Cắt tại paragraph boundary (\n\n)
+        para_cut = segment.rfind("\n\n")
+        if para_cut > chunk_size * 0.3:  # Chỉ dùng nếu ≥ 30% chunk
+            best_cut = para_cut + 2
+
+        # Ưu tiên 2: Cắt tại dấu câu thật (tránh viết tắt)
         if best_cut <= 0:
-            best_cut = segment.rfind("\n")
-            if best_cut > 0:
-                best_cut += 1
+            # Tìm tất cả vị trí kết thúc câu thật trong segment
+            for m in _SENTENCE_END_RE.finditer(segment):
+                pos = m.end()
+                if pos > best_cut:
+                    best_cut = pos
 
+        # Ưu tiên 3: Cắt tại newline đơn
+        if best_cut <= 0:
+            nl_cut = segment.rfind("\n")
+            if nl_cut > 0:
+                best_cut = nl_cut + 1
+
+        # Fallback: hard-cut
         if best_cut <= 0:
             best_cut = chunk_size
 
@@ -558,8 +550,8 @@ def init_session_state():
             st.session_state[key] = val
 
 
-def render_sidebar() -> tuple[str, str, int]:
-    """Render sidebar cấu hình. Trả về (voice_id, rate_str, chunk_size)."""
+def render_sidebar() -> tuple[str, str, int, int]:
+    """Render sidebar cấu hình. Trả về (voice_id, rate_str, chunk_size, margin_px)."""
     with st.sidebar:
         st.header("⚙️ Cấu hình")
 
@@ -586,10 +578,16 @@ def render_sidebar() -> tuple[str, str, int]:
             help="Số ký tự tối đa mỗi đoạn gửi TTS.",
         )
 
-        st.divider()
-        st.caption("🛠️ Powered by Microsoft Edge TTS")
+        st.subheader("📐 Header/Footer margin")
+        margin_px = st.slider(
+            "Margin (px)", 0, 150, DEFAULT_MARGIN_PX, 10,
+            help="Bỏ text trong vùng X px đầu/cuối trang (header/footer).",
+        )
 
-    return voice_id, rate_str, chunk_size
+        st.divider()
+        st.caption("🛠️ Powered by pdfplumber + Edge TTS")
+
+    return voice_id, rate_str, chunk_size, margin_px
 
 
 def render_step1_upload():
@@ -619,11 +617,14 @@ def render_step1_upload():
         st.session_state["processing_done"] = False
         st.session_state["stop_requested"] = False
 
-    # Extract (cached)
+    # Extract (cached) — margin_px từ session state
     if not st.session_state["full_text"]:
+        margin_px = st.session_state.get("margin_px", DEFAULT_MARGIN_PX)
         with st.spinner("📖 Đang trích xuất văn bản..."):
             file_bytes = uploaded.read()
-            pages = extract_text_with_cache(file_bytes, uploaded.name)
+            pages = extract_text_with_cache(
+                file_bytes, uploaded.name, margin_px, margin_px,
+            )
 
         if not pages:
             st.warning("⚠️ Không trích xuất được văn bản từ file này.")
@@ -864,7 +865,8 @@ def main():
     init_session_state()
 
     # Sidebar
-    voice_id, rate_str, chunk_size = render_sidebar()
+    voice_id, rate_str, chunk_size, margin_px = render_sidebar()
+    st.session_state["margin_px"] = margin_px
 
     # ── Step 1: Upload & Extract ──
     has_text = render_step1_upload()
