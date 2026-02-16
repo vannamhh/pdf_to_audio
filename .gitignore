@@ -1,0 +1,8 @@
+output/*
+/output
+output
+.venv
+.git
+__pycache__
+*.pdf
+*.mp3
