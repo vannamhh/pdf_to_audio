@@ -1,21 +1,25 @@
 # AI Audio Book Converter
 
-Ứng dụng Streamlit giúp chuyển đổi sách điện tử (PDF) thành sách nói (Audiobook - MP3) sử dụng công nghệ Text-to-Speech (TTS) chất lượng cao từ Microsoft Edge (Edge TTS).
+Ứng dụng Streamlit giúp chuyển đổi sách điện tử (PDF) thành sách nói (Audiobook - MP3) sử dụng công nghệ Text-to-Speech (TTS) chất lượng cao từ nhiều nguồn (Edge TTS, Google Cloud TTS, OpenAI TTS).
 
-## Chính sách & Tính năng
+## Tính năng nổi bật
 
 - **Chuyển đổi PDF sang Text**: Sử dụng `pdfplumber` để trích xuất văn bản, hỗ trợ loại bỏ Header/Footer bằng crop-box.
-- **Làm sạch văn bản thông minh**:
-  - Tự động nối các từ bị ngắt dòng (smart de-hyphenation).
-  - Loại bỏ số trang, ký tự rác.
-  - Nhận diện và giữ nguyên cấu trúc đoạn văn bản.
-- **Chỉnh sửa nội dung**: Cho phép xem trước và chỉnh sửa văn bản sau khi trích xuất trước khi chuyển thành giọng nói.
-- **Text-to-Speech (TTS)**:
-  - Sử dụng giọng đọc Neural tự nhiên (Hỗ trợ Tiếng Việt & Tiếng Anh).
-  - Tùy chỉnh tốc độ đọc.
+- **✨ AI Biên tập viên (Mới)**:
+  - Tích hợp **Google Gemini** để tự động sửa lỗi chính tả, lỗi OCR, nối từ bị ngắt dòng.
+  - Xử lý thông minh với tài liệu chuyên ngành (Y tế, Kỹ thuật...).
+- **Đa nguồn giọng đọc (Multi-Provider TTS)**:
+  - **Edge TTS**: Miễn phí, giọng đọc tự nhiên.
+  - **Google Cloud TTS**: Giọng đọc chuẩn, chất lượng cao (cần JSON Key).
+  - **OpenAI TTS**: Giọng đọc cực kỳ tự nhiên và cảm xúc (cần API Key).
+- **Quản lý & Bảo mật API Key**:
+  - Hỗ trợ file `.env` để lưu trữ API Key an toàn, không cần nhập lại mỗi lần sử dụng.
+- **Chỉnh sửa & Xuất văn bản**:
+  - Sửa trực tiếp nội dung từng đoạn trước khi tạo audio.
+  - Tải xuống hoặc lưu file text đã chỉnh sửa (`.txt`) để sử dụng lại.
 - **Quản lý file đầu ra**:
-  - Chia nhỏ file audio theo từng phần (Chunking) để tránh lỗi khi xử lý văn bản dài.
-  - Hỗ trợ **Resume** (tiếp tục tạo từ đoạn đang dang dở) và **Retry** (thử lại khi lỗi mạng).
+  - Chia nhỏ file audio theo từng phần (Chunking).
+  - Hỗ trợ **Resume** (tiếp tục tạo) và **Retry** (thử lại).
   - Tải xuống từng phần hoặc nén toàn bộ thành file ZIP.
 
 ## Cài đặt
@@ -41,6 +45,11 @@ Yêu cầu: Python 3.8 trở lên.
    pip install -r requirements.txt
    ```
 
+4. **Cấu hình API Key (Tùy chọn):**
+   - Copy file `.env.example` thành `.env`.
+   - Điền API Key của bạn vào file `.env` nếu muốn dùng tính năng nâng cao (Gemini, OpenAI, Google TTS).
+   - *Lưu ý: File `.env` đã được gitignore bảo vệ.*
+
 ## Sử dụng
 
 1. **Chạy ứng dụng:**
@@ -48,30 +57,37 @@ Yêu cầu: Python 3.8 trở lên.
    streamlit run app.py
    ```
 
-2. **Giao diện Web sẽ mở ra:**
-   - **Bước 1**: Upload file PDF cần chuyển đổi.
-   - **Bước 2**: Cấu hình biên (margin) để loại bỏ header/footer thừa. Kiểm tra và chỉnh sửa nội dung văn bản nếu cần.
-   - **Bước 3**: Chọn giọng đọc (Voice) và tốc độ (Rate). Nhấn **Tạo Audio**.
-   - **Bước 4**: Tải xuống các file MP3 sau khi hoàn tất.
+2. **Quy trình xử lý:**
+   - **Bước 1**: Upload file PDF.
+   - **Bước 2 (Editor)**:
+     - Xem và sửa văn bản.
+     - Bấm **"✨ AI sửa trang này"** hoặc **"✨ AI sửa toàn bộ"** để tự động sửa lỗi.
+     - Bấm **"💾 Xuất văn bản"** để tải về file text hoàn chỉnh.
+   - **Bước 3 (TTS Config)**: Chọn nguồn giọng đọc (Edge / Google / OpenAI) và cấu hình giọng.
+   - **Bước 4 (Processing)**: Bấm **Tạo Audio** và tải xuống kết quả.
 
 ## Cấu trúc thư mục
 
 ```
 convert_audio/
-├── app.py                # Mã nguồn chính của ứng dụng Streamlit
-├── requirements.txt      # Danh sách thư viện phụ thuộc
-├── output/               # Thư mục chứa các file MP3 đầu ra (được gitignore)
-├── .gitignore            # Cấu hình file cần bỏ qua của Git
+├── app.py                # Mã nguồn chính
+├── requirements.txt      # Danh sách thư viện
+├── output/               # Chứa file MP3 đầu ra (được gitignore)
+├── .env                  # Lưu API Key (được gitignore)
+├── usage_log.json        # Log hạn ngạch Google TTS Free Tier
 └── ...
 ```
 
 ## Thư viện chính
 
-- [Streamlit](https://streamlit.io/): Framework giao diện Web.
-- [pdfplumber](https://github.com/jsvine/pdfplumber): Trích xuất văn bản từ PDF.
-- [edge-tts](https://github.com/rany2/edge-tts): API Python cho Microsoft Edge TTS.
+- [Streamlit](https://streamlit.io/): Framework UI.
+- [pdfplumber](https://github.com/jsvine/pdfplumber): Trích xuất PDF.
+- [edge-tts](https://github.com/rany2/edge-tts): Microsoft Edge TTS (Free).
+- [google-genai](https://pypi.org/project/google-genai/): Google Gemini SDK (Mới).
+- [google-cloud-texttospeech](https://cloud.google.com/text-to-speech): Google TTS API.
+- [openai](https://github.com/openai/openai-python): OpenAI API.
 
 ## Lưu ý
 
-- File PDF nên là dạng text-based (có thể bôi đen chữ được). File dạng ảnh (scan) sẽ không hoạt động tốt nếu không có lớp text ẩn (OCR).
-- Tốc độ chuyển đổi phụ thuộc vào kết nối mạng (do gọi API Edge TTS).
+- File PDF nên là dạng text-based. File scan ảnh cần OCR trước.
+- **Google Cloud TTS Free Tier**: 1 triệu ký tự/tháng. App có bộ đếm quota tích hợp để theo dõi.

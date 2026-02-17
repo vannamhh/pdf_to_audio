@@ -2,5 +2,7 @@ streamlit
 pdfplumber
 edge-tts
 python-docx
+python-dotenv
 google-cloud-texttospeech
 openai
+google-genai

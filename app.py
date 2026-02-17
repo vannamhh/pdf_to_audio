@@ -23,6 +23,8 @@ import tempfile
 import time
 import hashlib
 import zipfile
+
+from dotenv import load_dotenv
 from abc import ABC, abstractmethod
 
 import edge_tts
@@ -70,6 +72,10 @@ RETRY_DELAY_SECONDS = 2
 GOOGLE_FREE_TIER_LIMIT = 1_000_000  # 1 triệu ký tự / tháng
 OUTPUT_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output")
 USAGE_LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "usage_log.json")
+_DOTENV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+
+# Load .env từ thư mục project
+load_dotenv(_DOTENV_PATH)
 
 # Regex: dấu chấm kết thúc câu thật (tránh viết tắt)
 _SENTENCE_END_RE = re.compile(
@@ -887,12 +893,171 @@ def _save_uploaded_json_to_temp(uploaded_file) -> str:
 
 
 # ──────────────────────────────────────────────
+# AI PROOFREADING — Gemini
+# ──────────────────────────────────────────────
+
+GEMINI_SYSTEM_PROMPT = (
+    "Bạn là một biên tập viên tiếng Việt chuyên nghiệp. "
+    "Nhiệm vụ của bạn là sửa lại văn bản sau đây được trích xuất từ OCR.\n"
+    "Yêu cầu:\n"
+    "- Sửa lỗi chính tả (ví dụ: 'chỉ phí' -> 'chi phí', 'phân 1' -> 'phần 1').\n"
+    "- Sửa lỗi dính từ, ngắt dòng sai, ký tự rác.\n"
+    "- Tuyệt đối KHÔNG thay đổi văn phong, ý nghĩa hoặc tóm tắt nội dung. "
+    "Giữ nguyên cấu trúc gốc.\n"
+    "- Chỉ trả về văn bản đã sửa, không thêm lời dẫn."
+)
+
+GEMINI_MODELS = ["gemini-2.0-flash", "gemini-2.0-flash-lite", "gemini-1.5-flash"]
+
+
+def _strip_markdown_wrapper(text: str) -> str:
+    """
+    Loại bỏ markdown code-block wrapper mà Gemini đôi khi thêm vào.
+
+    Ví dụ: ```\nNội dung\n``` → Nội dung
+    Cũng xử lý: ```text\nNội dung\n``` hoặc ```markdown\n...\n```
+    """
+    # Bỏ code-block bao ngoài (greedy, dotall)
+    stripped = re.sub(
+        r'^```(?:\w*)\s*\n(.*?)```\s*$',
+        r'\1',
+        text.strip(),
+        flags=re.DOTALL,
+    )
+    # Bỏ dòng dẫn nhập kiểu "Dưới đây là văn bản đã sửa:" nếu có
+    stripped = re.sub(
+        r'^(?:Dưới đây là|Here is|Đây là).*?(?::\s*\n)',
+        '',
+        stripped.strip(),
+        count=1,
+        flags=re.IGNORECASE,
+    )
+    return stripped.strip()
+
+
+def clean_text_with_ai(text: str, api_key: str, model_name: str = "gemini-2.0-flash") -> tuple[bool, str]:
+    """
+    Sử dụng Google Gemini để sửa lỗi chính tả / OCR cho đoạn text.
+
+    Sử dụng SDK mới: google.genai (thay thế google.generativeai đã deprecated).
+
+    Args:
+        text: Văn bản cần sửa.
+        api_key: Google AI API Key.
+        model_name: Tên model Gemini.
+
+    Returns:
+        (success, result_text_or_error_message)
+    """
+    if not text.strip():
+        return True, text
+
+    try:
+        from google import genai
+        from google.genai import types
+    except ImportError:
+        return False, (
+            "❌ Thiếu thư viện google-genai. "
+            "Chạy: pip install google-genai"
+        )
+
+    # Tắt tất cả safety filters — cần thiết cho tài liệu chuyên ngành
+    safety_settings = [
+        types.SafetySetting(
+            category=types.HarmCategory.HARM_CATEGORY_HARASSMENT,
+            threshold=types.HarmBlockThreshold.BLOCK_NONE,
+        ),
+        types.SafetySetting(
+            category=types.HarmCategory.HARM_CATEGORY_HATE_SPEECH,
+            threshold=types.HarmBlockThreshold.BLOCK_NONE,
+        ),
+        types.SafetySetting(
+            category=types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
+            threshold=types.HarmBlockThreshold.BLOCK_NONE,
+        ),
+        types.SafetySetting(
+            category=types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
+            threshold=types.HarmBlockThreshold.BLOCK_NONE,
+        ),
+    ]
+
+    try:
+        client = genai.Client(api_key=api_key)
+        response = client.models.generate_content(
+            model=model_name,
+            contents=text,
+            config=types.GenerateContentConfig(
+                system_instruction=GEMINI_SYSTEM_PROMPT,
+                safety_settings=safety_settings,
+            ),
+        )
+
+        # Kiểm tra response bị block
+        if not response.candidates:
+            block_reason = getattr(
+                response.prompt_feedback, 'block_reason', 'Unknown'
+            )
+            return False, (
+                f"🚫 Gemini từ chối xử lý (block_reason: {block_reason}). "
+                f"Có thể do nội dung nhạy cảm. Hãy thử lại hoặc sửa thủ công."
+            )
+
+        candidate = response.candidates[0]
+        if (
+            candidate.finish_reason
+            and hasattr(candidate.finish_reason, 'name')
+            and candidate.finish_reason.name == "SAFETY"
+        ):
+            return False, (
+                "🚫 Gemini chặn kết quả do Safety Filter. "
+                "Nội dung chunk này cần sửa thủ công."
+            )
+
+        result_text = response.text
+        if not result_text or not result_text.strip():
+            return False, "⚠️ Gemini trả về kết quả rỗng."
+
+        # Strip markdown wrapper nếu Gemini thêm vào
+        cleaned = _strip_markdown_wrapper(result_text)
+        return True, cleaned
+
+    except Exception as e:
+        return False, f"❌ Lỗi Gemini API: {e}"
+
+
+# ──────────────────────────────────────────────
 # STREAMLIT UI
 # ──────────────────────────────────────────────
 
 
+def _save_env_key(key: str, value: str) -> None:
+    """
+    Ghi hoặc cập nhật một key=value vào file .env.
+
+    Nếu key đã tồn tại, sẽ cập nhật giá trị. Nếu chưa, sẽ thêm dòng mới.
+    """
+    lines: list[str] = []
+    found = False
+    if os.path.exists(_DOTENV_PATH):
+        with open(_DOTENV_PATH, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+
+    new_line = f"{key}={value}\n"
+    for i, line in enumerate(lines):
+        if line.strip().startswith(f"{key}="):
+            lines[i] = new_line
+            found = True
+            break
+
+    if not found:
+        lines.append(new_line)
+
+    with open(_DOTENV_PATH, "w", encoding="utf-8") as f:
+        f.writelines(lines)
+
+
 def init_session_state():
-    """Khởi tạo session_state mặc định."""
+    """Khởi tạo session_state mặc định, load keys từ .env."""
     defaults = {
         "full_text": "",
         "chunks": [],
@@ -901,9 +1066,12 @@ def init_session_state():
         "processing_done": False,
         "stop_requested": False,
         "current_file_name": "",
-        # Provider-specific state
-        "google_credentials_path": "",
-        "openai_api_key": "",
+        # Provider-specific state — load từ .env nếu có
+        "google_credentials_path": os.environ.get("GOOGLE_CREDENTIALS_PATH", ""),
+        "openai_api_key": os.environ.get("OPENAI_API_KEY", ""),
+        # AI Proofreading state
+        "gemini_api_key": os.environ.get("GEMINI_API_KEY", ""),
+        "gemini_model": GEMINI_MODELS[0],
     }
     for key, val in defaults.items():
         if key not in st.session_state:
@@ -964,26 +1132,32 @@ def render_sidebar() -> tuple[TTSProvider | None, dict, int, int]:
         # ═══════════════════════════════════════
         elif selected_provider == PROVIDER_GOOGLE:
             st.subheader("🔑 Google Cloud Credentials")
-            uploaded_json = st.file_uploader(
-                "Upload Service Account JSON",
-                type=["json"],
-                help="File JSON key từ Google Cloud Console (IAM → Service Accounts).",
-                key="google_json_uploader",
-            )
 
-            if uploaded_json is not None:
-                try:
-                    # Validate JSON structure
-                    content = uploaded_json.getvalue()
-                    parsed = json.loads(content)
-                    if "type" not in parsed or parsed.get("type") != "service_account":
-                        st.error("❌ File JSON không phải Service Account key hợp lệ.")
-                    else:
-                        cred_path = _save_uploaded_json_to_temp(uploaded_json)
-                        st.session_state["google_credentials_path"] = cred_path
-                        st.success("✅ Credentials đã được tải lên.")
-                except json.JSONDecodeError:
-                    st.error("❌ File không phải JSON hợp lệ.")
+            # Auto-load từ .env nếu đã lưu trước đó
+            saved_cred = st.session_state.get("google_credentials_path", "")
+            if saved_cred and os.path.exists(saved_cred):
+                st.success(f"✅ Credentials đã lưu: `{os.path.basename(saved_cred)}`")
+            else:
+                uploaded_json = st.file_uploader(
+                    "Upload Service Account JSON",
+                    type=["json"],
+                    help="File JSON key từ Google Cloud Console (IAM → Service Accounts).",
+                    key="google_json_uploader",
+                )
+
+                if uploaded_json is not None:
+                    try:
+                        content = uploaded_json.getvalue()
+                        parsed = json.loads(content)
+                        if "type" not in parsed or parsed.get("type") != "service_account":
+                            st.error("❌ File JSON không phải Service Account key hợp lệ.")
+                        else:
+                            cred_path = _save_uploaded_json_to_temp(uploaded_json)
+                            st.session_state["google_credentials_path"] = cred_path
+                            _save_env_key("GOOGLE_CREDENTIALS_PATH", cred_path)
+                            st.success("✅ Credentials đã tải lên và lưu.")
+                    except json.JSONDecodeError:
+                        st.error("❌ File không phải JSON hợp lệ.")
 
             st.subheader("🎤 Giọng đọc (Google Cloud)")
             google_voice_label = st.selectbox(
@@ -1037,17 +1211,22 @@ def render_sidebar() -> tuple[TTSProvider | None, dict, int, int]:
         # ═══════════════════════════════════════
         elif selected_provider == PROVIDER_OPENAI:
             st.subheader("🔑 OpenAI API Key")
+            saved_openai = st.session_state.get("openai_api_key", "")
             api_key = st.text_input(
                 "Nhập API Key",
                 type="password",
+                value=saved_openai,
                 placeholder="sk-...",
                 help="API Key từ https://platform.openai.com/api-keys",
                 key="openai_key_input",
             )
 
-            if api_key:
+            if api_key and api_key != saved_openai:
                 st.session_state["openai_api_key"] = api_key
-                st.success("✅ API Key đã nhập.")
+                _save_env_key("OPENAI_API_KEY", api_key)
+                st.success("✅ API Key đã lưu.")
+            elif api_key:
+                st.success("✅ API Key đã lưu từ lần trước.")
 
             st.subheader("🤖 Model")
             openai_model = st.selectbox(
@@ -1095,6 +1274,37 @@ def render_sidebar() -> tuple[TTSProvider | None, dict, int, int]:
             "Margin (px)", 0, 150, DEFAULT_MARGIN_PX, 10,
             help="Bỏ text trong vùng X px đầu/cuối trang (header/footer).",
         )
+
+        # ── AI Proofreading config ──
+        st.divider()
+        st.subheader("✨ AI Biên tập viên")
+        st.caption(
+            "Dùng Google Gemini để tự động sửa lỗi chính tả, OCR. "
+            "[Lấy API Key](https://aistudio.google.com/apikey)"
+        )
+        saved_gemini = st.session_state.get("gemini_api_key", "")
+        gemini_key = st.text_input(
+            "Google AI API Key",
+            type="password",
+            value=saved_gemini,
+            placeholder="AIza...",
+            key="gemini_key_input",
+        )
+        if gemini_key and gemini_key != saved_gemini:
+            st.session_state["gemini_api_key"] = gemini_key
+            _save_env_key("GEMINI_API_KEY", gemini_key)
+            st.success("✅ API Key đã lưu.")
+        elif gemini_key:
+            st.caption("✅ API Key đã lưu từ lần trước.")
+
+        gemini_model = st.selectbox(
+            "Model",
+            GEMINI_MODELS,
+            index=0,
+            help="gemini-2.0-flash: nhanh & rẻ (khuyên dùng).",
+            key="gemini_model_select",
+        )
+        st.session_state["gemini_model"] = gemini_model
 
         st.divider()
         provider_label = selected_provider.split(" (")[0] if provider else "—"
@@ -1199,15 +1409,53 @@ def render_step2_editor(chunk_size: int):
         st.caption(f"Phần {page}/{total_chunks} · {len(chunks[page - 1]):,} ký tự")
 
     chunk_idx = page - 1
+    widget_key = f"chunk_editor_{page}"
+
+    # ── Pending AI result: áp dụng TRƯỚC khi widget được tạo ──
+    # Streamlit chỉ cho phép set session_state[widget_key] TRƯỚC khi widget render.
+    pending = st.session_state.pop("_ai_pending_chunks", None)
+    if pending and isinstance(pending, dict):
+        for p_idx_str, p_text in pending.items():
+            wk = f"chunk_editor_{p_idx_str}"
+            st.session_state[wk] = p_text
+        st.toast(f"✅ AI đã sửa xong — nội dung đã cập nhật.", icon="✨")
+
+    # Khởi tạo widget value nếu chưa có
+    if widget_key not in st.session_state:
+        st.session_state[widget_key] = chunks[chunk_idx]
+
     edited = st.text_area(
         f"Nội dung phần {page}",
-        value=chunks[chunk_idx],
         height=350,
-        key=f"chunk_editor_{page}",
+        key=widget_key,
         label_visibility="collapsed",
     )
 
-    if st.button("💾 Lưu chỉnh sửa", key="save_edits"):
+    # ── Action buttons ──
+    col_save, col_ai_one, col_ai_all = st.columns([1, 1, 1])
+
+    with col_save:
+        save_clicked = st.button("💾 Lưu chỉnh sửa", key="save_edits")
+    with col_ai_one:
+        ai_key = st.session_state.get("gemini_api_key", "")
+        ai_one_clicked = st.button(
+            "✨ AI sửa trang này",
+            key="ai_fix_one",
+            disabled=not ai_key,
+            help="Sửa lỗi chính tả / OCR cho phần hiện tại bằng Gemini." if ai_key
+                 else "Cần nhập Google AI API Key ở sidebar.",
+        )
+    with col_ai_all:
+        ai_all_clicked = st.button(
+            "✨ AI sửa toàn bộ",
+            key="ai_fix_all",
+            disabled=not ai_key,
+            help="Sửa lỗi tất cả các phần (lần lượt)." if ai_key
+                 else "Cần nhập Google AI API Key ở sidebar.",
+        )
+
+    # ── Save handler ──
+    if save_clicked:
         if edited != chunks[chunk_idx]:
             chunks[chunk_idx] = edited
             st.session_state["chunks"] = chunks
@@ -1223,6 +1471,105 @@ def render_step2_editor(chunk_size: int):
                 st.info(f"🗑️ Đã xóa file audio cũ Part {page:03d} (text đã thay đổi).")
         else:
             st.info("ℹ️ Không có thay đổi.")
+
+    # ── AI fix ONE chunk ──
+    if ai_one_clicked and ai_key:
+        model_name = st.session_state.get("gemini_model", GEMINI_MODELS[0])
+        with st.spinner(f"✨ Gemini ({model_name}) đang sửa phần {page}..."):
+            success, result = clean_text_with_ai(chunks[chunk_idx], ai_key, model_name)
+        if success:
+            chunks[chunk_idx] = result
+            st.session_state["chunks"] = chunks
+            st.session_state["full_text"] = "\n\n".join(chunks)
+            # Xóa MP3 cũ vì text đã đổi
+            old_mp3 = chunk_filepath(
+                st.session_state["output_folder"],
+                st.session_state["base_name"],
+                page,
+            )
+            if os.path.exists(old_mp3):
+                os.remove(old_mp3)
+            # Lưu vào pending buffer → rerun → áp dụng TRƯỚC widget
+            st.session_state["_ai_pending_chunks"] = {str(page): result}
+            st.rerun()
+        else:
+            st.error(result)
+
+    # ── AI fix ALL chunks ──
+    if ai_all_clicked and ai_key:
+        model_name = st.session_state.get("gemini_model", GEMINI_MODELS[0])
+        progress = st.progress(0)
+        status = st.empty()
+        fixed_count = 0
+        error_count = 0
+        pending_updates: dict[str, str] = {}
+
+        for idx in range(total_chunks):
+            status.text(f"✨ [{model_name}] Đang sửa phần {idx + 1}/{total_chunks}...")
+            success, result = clean_text_with_ai(chunks[idx], ai_key, model_name)
+            if success:
+                if result != chunks[idx]:
+                    chunks[idx] = result
+                    fixed_count += 1
+                    pending_updates[str(idx + 1)] = result
+                    # Xóa MP3 cũ
+                    old_mp3 = chunk_filepath(
+                        st.session_state["output_folder"],
+                        st.session_state["base_name"],
+                        idx + 1,
+                    )
+                    if os.path.exists(old_mp3):
+                        os.remove(old_mp3)
+            else:
+                error_count += 1
+                st.warning(f"⚠️ Phần {idx + 1}: {result}")
+            progress.progress((idx + 1) / total_chunks)
+
+        st.session_state["chunks"] = chunks
+        st.session_state["full_text"] = "\n\n".join(chunks)
+        status.text(
+            f"✅ Hoàn tất! Đã sửa {fixed_count}/{total_chunks} phần"
+            + (f", {error_count} lỗi." if error_count else ".")
+        )
+        if fixed_count > 0:
+            # Lưu vào pending buffer → rerun → áp dụng TRƯỚC widget
+            st.session_state["_ai_pending_chunks"] = pending_updates
+            st.rerun()
+
+    # ── Export văn bản đã chỉnh sửa ──
+    st.divider()
+    st.markdown("#### 💾 Xuất văn bản")
+
+    current_text = st.session_state.get("full_text", "")
+    if current_text:
+        file_name = st.session_state.get("current_file_name", "document")
+        base_name = os.path.splitext(file_name)[0]
+        txt_filename = f"{base_name}_corrected.txt"
+
+        col_dl, col_save = st.columns(2)
+
+        with col_dl:
+            st.download_button(
+                "⬇️ Download file .txt",
+                data=current_text.encode("utf-8"),
+                file_name=txt_filename,
+                mime="text/plain",
+                key="download_corrected_text",
+            )
+
+        with col_save:
+            if st.button("📂 Lưu vào thư mục output", key="save_text_to_folder"):
+                output_folder = st.session_state.get("output_folder", "")
+                if not output_folder:
+                    # Tạo output folder nếu chưa có
+                    output_folder = os.path.join(OUTPUT_ROOT, base_name)
+                    os.makedirs(output_folder, exist_ok=True)
+                    st.session_state["output_folder"] = output_folder
+
+                save_path = os.path.join(output_folder, txt_filename)
+                with open(save_path, "w", encoding="utf-8") as f:
+                    f.write(current_text)
+                st.success(f"✅ Đã lưu: `{save_path}`")
 
 
 def render_step4_processing(provider: TTSProvider | None, tts_config: dict):
