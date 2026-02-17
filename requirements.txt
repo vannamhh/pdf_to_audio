@@ -1,3 +1,6 @@
 streamlit
 pdfplumber
 edge-tts
+python-docx
+google-cloud-texttospeech
+openai

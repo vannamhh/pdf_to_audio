@@ -1,25 +1,29 @@
 """
-AI Audio Book Converter — v3 (PyMuPDF Engine)
-==============================================
-Streamlit app chuyển đổi file PDF → MP3 audiobook.
+AI Audio Book Converter — v4 (Multi-Provider TTS)
+==================================================
+Streamlit app chuyển đổi file PDF/DOCX/TXT → MP3 audiobook.
 
-v3 Cải tiến:
-- PyMuPDF (fitz) block-based extraction → nhận diện đoạn văn chính xác.
-- Bounding-box header/footer removal (configurable margin).
-- Smart de-hyphenation (chỉ nối khi từ tiếp theo viết thường).
-- Paragraph-aware chunking (ưu tiên \n\n, tránh cắt viết tắt).
-- Giữ nguyên: Resume, Retry, Stop/Pause, Partial Download, Editor.
+v4 Cải tiến:
+- Multi-Provider TTS Architecture (Strategy Pattern).
+  + Edge TTS  (Miễn phí — default)
+  + Google Cloud TTS (cần Service Account JSON)
+  + OpenAI TTS (cần API Key)
+- Dynamic Sidebar UI theo provider được chọn.
+- Giữ nguyên: Resume, Retry, Stop/Pause, Partial Download, Pagination Editor.
 
 Chạy:  streamlit run app.py
 """
 
 import asyncio
 import io
+import json
 import os
 import re
+import tempfile
 import time
 import hashlib
 import zipfile
+from abc import ABC, abstractmethod
 
 import edge_tts
 import pdfplumber
@@ -30,7 +34,13 @@ from docx import Document
 # CONSTANTS
 # ──────────────────────────────────────────────
 
-VOICE_OPTIONS = {
+PROVIDER_EDGE = "Edge TTS (Miễn phí)"
+PROVIDER_GOOGLE = "Google Cloud TTS"
+PROVIDER_OPENAI = "OpenAI TTS"
+PROVIDER_LIST = [PROVIDER_EDGE, PROVIDER_GOOGLE, PROVIDER_OPENAI]
+
+# --- Edge TTS voices ---
+EDGE_VOICE_OPTIONS = {
     "🇻🇳 Hoài My (Nữ - VN)": "vi-VN-HoaiMyNeural",
     "🇻🇳 Nam Minh (Nam - VN)": "vi-VN-NamMinhNeural",
     "🇺🇸 Aria (Female - US)": "en-US-AriaNeural",
@@ -38,14 +48,30 @@ VOICE_OPTIONS = {
     "🇬🇧 Sonia (Female - UK)": "en-GB-SoniaNeural",
 }
 
+# --- Google Cloud TTS voices ---
+GOOGLE_VOICE_OPTIONS = {
+    "vi-VN-Neural2-A (Female)": {"name": "vi-VN-Neural2-A", "language_code": "vi-VN", "ssml_gender": "FEMALE"},
+    "vi-VN-Neural2-D (Male)": {"name": "vi-VN-Neural2-D", "language_code": "vi-VN", "ssml_gender": "MALE"},
+    "vi-VN-Wavenet-A (Female)": {"name": "vi-VN-Wavenet-A", "language_code": "vi-VN", "ssml_gender": "FEMALE"},
+    "vi-VN-Wavenet-C (Male)": {"name": "vi-VN-Wavenet-C", "language_code": "vi-VN", "ssml_gender": "MALE"},
+    "vi-VN-Wavenet-D (Male)": {"name": "vi-VN-Wavenet-D", "language_code": "vi-VN", "ssml_gender": "MALE"},
+    "en-US-Neural2-A (Female)": {"name": "en-US-Neural2-A", "language_code": "en-US", "ssml_gender": "FEMALE"},
+    "en-US-Neural2-D (Male)": {"name": "en-US-Neural2-D", "language_code": "en-US", "ssml_gender": "MALE"},
+}
+
+# --- OpenAI TTS voices & models ---
+OPENAI_VOICE_OPTIONS = ["alloy", "echo", "fable", "onyx", "nova", "shimmer"]
+OPENAI_TTS_MODELS = ["tts-1", "tts-1-hd"]
+
 DEFAULT_CHUNK_SIZE = 3000
 DEFAULT_MARGIN_PX = 50
 MAX_RETRIES = 3
 RETRY_DELAY_SECONDS = 2
+GOOGLE_FREE_TIER_LIMIT = 1_000_000  # 1 triệu ký tự / tháng
 OUTPUT_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output")
+USAGE_LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "usage_log.json")
 
 # Regex: dấu chấm kết thúc câu thật (tránh viết tắt)
-# Negative lookbehind cho các viết tắt phổ biến VN & EN
 _SENTENCE_END_RE = re.compile(
     r'(?<!Mr)(?<!Mrs)(?<!Ms)(?<!Dr)(?<!St)(?<!vs)'
     r'(?<!Tp)(?<!PGS)(?<!TS)(?<!GS)(?<!Ths)(?<!KS)'
@@ -53,6 +79,262 @@ _SENTENCE_END_RE = re.compile(
     r'[.!?]["\u201D»)\]]*'
     r'(?=\s|$)',
 )
+
+
+# ══════════════════════════════════════════════
+# QUOTA MANAGER — Google Cloud Free Tier Guard
+# ══════════════════════════════════════════════
+
+
+class QuotaManager:
+    """
+    Quản lý hạn ngạch miễn phí Google Cloud TTS (1M ký tự/tháng).
+
+    Lưu lịch sử sử dụng vào file JSON cục bộ. Tự động reset khi sang tháng mới.
+    """
+
+    def __init__(self, log_path: str = USAGE_LOG_PATH, limit: int = GOOGLE_FREE_TIER_LIMIT):
+        self._log_path = log_path
+        self._limit = limit
+        self._data = self._load()
+
+    def _current_month(self) -> str:
+        """Trả về tháng hiện tại dạng YYYY-MM."""
+        from datetime import datetime
+        return datetime.now().strftime("%Y-%m")
+
+    def _load(self) -> dict:
+        """Đọc file log. Reset nếu sang tháng mới."""
+        default = {"current_month": self._current_month(), "used_chars": 0}
+        if not os.path.exists(self._log_path):
+            return default
+        try:
+            with open(self._log_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            # Reset nếu sang tháng mới
+            if data.get("current_month") != self._current_month():
+                return default
+            return data
+        except (json.JSONDecodeError, KeyError, OSError):
+            return default
+
+    def _save(self) -> None:
+        """Ghi data ra file JSON."""
+        try:
+            with open(self._log_path, "w", encoding="utf-8") as f:
+                json.dump(self._data, f, indent=2, ensure_ascii=False)
+        except OSError as e:
+            print(f"⚠️ Không thể lưu usage log: {e}")
+
+    @property
+    def used_chars(self) -> int:
+        return self._data.get("used_chars", 0)
+
+    @property
+    def limit(self) -> int:
+        return self._limit
+
+    @property
+    def remaining(self) -> int:
+        return max(0, self._limit - self.used_chars)
+
+    @property
+    def usage_ratio(self) -> float:
+        """Tỷ lệ sử dụng (0.0 → 1.0)."""
+        return min(1.0, self.used_chars / self._limit) if self._limit > 0 else 1.0
+
+    def check(self, char_count: int) -> tuple[bool, str]:
+        """
+        Kiểm tra xem có đủ quota cho char_count ký tự không.
+
+        Returns:
+            (allowed, message)
+        """
+        if self.used_chars + char_count > self._limit:
+            return False, (
+                f"🚫 Đã hết hạn mức miễn phí tháng này! "
+                f"Đã dùng: {self.used_chars:,}/{self._limit:,} ký tự. "
+                f"Cần thêm: {char_count:,}. "
+                f"Vui lòng chuyển sang Edge TTS hoặc chờ tháng sau."
+            )
+        return True, "OK"
+
+    def record(self, char_count: int) -> None:
+        """Ghi nhận số ký tự đã sử dụng sau khi gọi API thành công."""
+        self._data["current_month"] = self._current_month()
+        self._data["used_chars"] = self.used_chars + char_count
+        self._save()
+
+
+# ══════════════════════════════════════════════
+# TTS PROVIDER — Strategy Pattern
+# ══════════════════════════════════════════════
+
+
+class TTSProvider(ABC):
+    """Abstract base class cho các TTS providers."""
+
+    @property
+    @abstractmethod
+    def name(self) -> str:
+        """Tên hiển thị của provider."""
+        ...
+
+    @abstractmethod
+    async def generate_audio(
+        self, text: str, output_path: str, config: dict
+    ) -> tuple[bool, str]:
+        """
+        Chuyển text → file MP3.
+
+        Args:
+            text: Đoạn văn bản cần đọc.
+            output_path: Đường dẫn file MP3 output.
+            config: Dict chứa voice, rate, và các tùy chọn riêng provider.
+
+        Returns:
+            (success, message)
+        """
+        ...
+
+
+class EdgeTTSProvider(TTSProvider):
+    """Edge TTS — Miễn phí, sử dụng Microsoft Edge Neural Voices."""
+
+    @property
+    def name(self) -> str:
+        return "Edge TTS"
+
+    async def generate_audio(
+        self, text: str, output_path: str, config: dict
+    ) -> tuple[bool, str]:
+        voice = config["voice"]
+        rate = config.get("rate", "+0%")
+        communicate = edge_tts.Communicate(text, voice, rate=rate)
+        await communicate.save(output_path)
+        if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+            return True, "OK"
+        raise RuntimeError("File rỗng sau khi save")
+
+
+class GoogleCloudTTSProvider(TTSProvider):
+    """Google Cloud TTS — cần Service Account JSON key."""
+
+    def __init__(self, credentials_path: str, quota_manager: QuotaManager | None = None):
+        self._credentials_path = credentials_path
+        self._quota = quota_manager or QuotaManager()
+
+    @property
+    def name(self) -> str:
+        return "Google Cloud TTS"
+
+    async def generate_audio(
+        self, text: str, output_path: str, config: dict
+    ) -> tuple[bool, str]:
+        # Lazy import — chỉ cần khi dùng Google provider
+        try:
+            from google.cloud import texttospeech
+        except ImportError:
+            return False, (
+                "❌ Thiếu thư viện google-cloud-texttospeech. "
+                "Chạy: pip install google-cloud-texttospeech"
+            )
+
+        # ── Quota check ──
+        char_count = len(text)
+        allowed, quota_msg = self._quota.check(char_count)
+        if not allowed:
+            return False, quota_msg
+
+        # Thiết lập credentials
+        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = self._credentials_path
+
+        voice_info = config["voice_info"]  # dict: name, language_code, ssml_gender
+        language_code = voice_info["language_code"]
+        voice_name = voice_info["name"]
+        ssml_gender_str = voice_info["ssml_gender"]
+
+        # Map string → enum
+        gender_map = {
+            "FEMALE": texttospeech.SsmlVoiceGender.FEMALE,
+            "MALE": texttospeech.SsmlVoiceGender.MALE,
+        }
+        ssml_gender = gender_map.get(
+            ssml_gender_str, texttospeech.SsmlVoiceGender.NEUTRAL
+        )
+
+        client = texttospeech.TextToSpeechClient()
+
+        # Google Cloud TTS giới hạn 5000 bytes/request.
+        # Text tiếng Việt UTF-8 ≈ 2-3 bytes/ký tự → chunk 3000 ký tự ≈ an toàn.
+        synthesis_input = texttospeech.SynthesisInput(text=text)
+
+        voice_params = texttospeech.VoiceSelectionParams(
+            language_code=language_code,
+            name=voice_name,
+            ssml_gender=ssml_gender,
+        )
+
+        audio_config = texttospeech.AudioConfig(
+            audio_encoding=texttospeech.AudioEncoding.MP3,
+            speaking_rate=config.get("speaking_rate", 1.0),
+        )
+
+        response = client.synthesize_speech(
+            input=synthesis_input,
+            voice=voice_params,
+            audio_config=audio_config,
+        )
+
+        with open(output_path, "wb") as f:
+            f.write(response.audio_content)
+
+        if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+            # Ghi nhận quota sau khi thành công
+            self._quota.record(char_count)
+            return True, "OK"
+        raise RuntimeError("File rỗng sau khi save")
+
+
+class OpenAITTSProvider(TTSProvider):
+    """OpenAI TTS — cần API Key (sk-...)."""
+
+    def __init__(self, api_key: str):
+        self._api_key = api_key
+
+    @property
+    def name(self) -> str:
+        return "OpenAI TTS"
+
+    async def generate_audio(
+        self, text: str, output_path: str, config: dict
+    ) -> tuple[bool, str]:
+        # Lazy import
+        try:
+            from openai import OpenAI
+        except ImportError:
+            return False, "❌ Thiếu thư viện openai. Chạy: pip install openai"
+
+        model = config.get("model", "tts-1")
+        voice = config.get("voice", "alloy")
+        speed = config.get("speed", 1.0)
+
+        client = OpenAI(api_key=self._api_key)
+
+        response = client.audio.speech.create(
+            model=model,
+            voice=voice,
+            input=text,
+            speed=speed,
+            response_format="mp3",
+        )
+
+        response.stream_to_file(output_path)
+
+        if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+            return True, "OK"
+        raise RuntimeError("File rỗng sau khi save")
+
 
 # ──────────────────────────────────────────────
 # HELPERS — File & Folder
@@ -66,7 +348,6 @@ def get_output_folder(file_name: str) -> str:
     Cấu trúc: output/<tên_file_không_dấu>/
     """
     base = os.path.splitext(file_name)[0]
-    # Sanitize: chỉ giữ chữ cái, số, dấu gạch, khoảng trắng → gạch dưới
     safe_name = re.sub(r"[^\w\s\-]", "", base).strip()
     safe_name = re.sub(r"\s+", "_", safe_name)
     if not safe_name:
@@ -128,52 +409,43 @@ def extract_text_with_cache(
     try:
         with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
             total_pages = len(pdf.pages)
-            
+
             for page_num, page in enumerate(pdf.pages, start=1):
                 try:
-                    # Kiểm tra margin có vượt quá kích thước trang không
                     use_crop = margin_top + margin_bottom < page.height
-                    
+
                     if use_crop:
-                        # Cắt bỏ header/footer theo margin
                         bbox = (
-                            0,                                # x0 (left)
-                            margin_top,                       # y0 (top, cắt header)
-                            page.width,                       # x1 (right)
-                            page.height - margin_bottom,      # y1 (bottom, cắt footer)
+                            0,
+                            margin_top,
+                            page.width,
+                            page.height - margin_bottom,
                         )
                         cropped = page.crop(bbox)
                         text = cropped.extract_text()
                     else:
-                        # Fallback: margin quá lớn → lấy toàn bộ trang
                         text = page.extract_text()
-                    
-                    # Xử lý None/empty text
+
                     if text and text.strip():
                         pages_text.append(text)
                     else:
-                        # Trang không có text (có thể là ảnh scan)
                         skipped_pages += 1
-                        
+
                 except Exception as e:
-                    # Lỗi trang cụ thể → bỏ qua, không crash toàn bộ
                     skipped_pages += 1
-                    # Log cảnh báo nhưng không hiển thị error popup
                     print(f"⚠️ Trang {page_num}/{total_pages}: Bỏ qua do lỗi - {e}")
                     continue
-            
-            # Thông báo tổng kết nếu có trang bị skip
+
             if skipped_pages > 0:
                 st.warning(
                     f"ℹ️ Đã bỏ qua {skipped_pages}/{total_pages} trang "
                     f"(có thể là ảnh scan hoặc không có text)"
                 )
-                
+
     except Exception as e:
-        # Lỗi nghiêm trọng (file corrupt, không mở được)
         st.error(f"❌ Lỗi khi đọc PDF **{file_name}**: `{e}`")
         return []
-    
+
     return pages_text
 
 
@@ -196,12 +468,12 @@ def extract_docx(file_bytes: bytes, file_name: str) -> list[str]:
             text = para.text.strip()
             if text:
                 paragraphs_list.append(text)
-        
+
         if not paragraphs_list:
             st.warning("⚠️ File DOCX không chứa văn bản.")
     except Exception as e:
         st.error(f"❌ Lỗi khi đọc DOCX **{file_name}**: `{e}`")
-    
+
     return paragraphs_list
 
 
@@ -215,31 +487,28 @@ def extract_text_file(file_bytes: bytes, file_name: str) -> list[str]:
         file_name: Tên file gốc.
 
     Returns:
-        Danh sách đoạn văn (split by \n\n).
+        Danh sách đoạn văn (split by \\n\\n).
     """
     paragraphs_list: list[str] = []
     try:
-        # Thử decode UTF-8 (tiêng Việt)
         text = file_bytes.decode('utf-8')
     except UnicodeDecodeError:
         try:
-            # Fallback: Windows-1252 hoặc Latin-1
             text = file_bytes.decode('latin-1')
             st.warning("⚠️ File không phải UTF-8, dùng Latin-1 encoding.")
         except Exception as e:
             st.error(f"❌ Không thể decode file **{file_name}**: `{e}`")
             return []
-    
-    # Tách theo đoạn văn (double newline)
+
     paragraphs = text.split('\n\n')
     for para in paragraphs:
         cleaned = para.strip()
         if cleaned:
             paragraphs_list.append(cleaned)
-    
+
     if not paragraphs_list:
         st.warning("⚠️ File text trống hoặc không có nội dung.")
-    
+
     return paragraphs_list
 
 
@@ -294,26 +563,21 @@ def _is_heading_line(line: str) -> bool:
     s = line.strip()
     if not s or len(s) > 100:
         return False
-    # Kết thúc bằng dấu câu nội dung → không phải heading
     if re.search(r"[!?;,]\s*$", s):
         return False
     if re.search(r"[a-zA-ZÀ-ỹ]\.\s*$", s) and len(s) > 60:
         return False
-    # Toàn chữ hoa (>= 3 ký tự chữ)
     alpha_chars = re.findall(r"[a-zA-ZÀ-ỹ]", s)
     if len(alpha_chars) >= 3 and s == s.upper():
         return True
-    # Keyword tiêu đề (VN + EN)
     if re.match(
         r"^(Chương|CHƯƠNG|Phần|PHẦN|Bài|BÀI|Mục|MỤC|"
         r"Chapter|CHAPTER|Part|PART|Section|SECTION)\b",
         s,
     ):
         return True
-    # Dotted section number
     if re.match(r"^\d+(\.\d+)+\.?\s", s):
         return True
-    # Ngắn + chữ hoa đầu
     if len(s) < 60 and len(s.split()) <= 10:
         first_alpha = re.search(r"[a-zA-ZÀ-ỹ]", s)
         if first_alpha and first_alpha.group().isupper():
@@ -325,7 +589,6 @@ def _buffer_ends_complete(buffer: str) -> bool:
     """Kiểm tra buffer kết thúc bằng câu hoàn chỉnh (dấu câu, không phải viết tắt)."""
     if not buffer:
         return True
-    # Nếu kết thúc bằng viết tắt + dấu chấm → chưa hết câu
     if re.search(
         r'(?:Mr|Mrs|Ms|Dr|St|vs|Tp|PGS|TS|GS|Ths|KS|ThS|Q|P|Tr)\.' r'\s*$',
         buffer,
@@ -354,7 +617,6 @@ def _reflow_paragraphs(text: str) -> str:
             blank_count += 1
             continue
 
-        # Xử lý dòng trống tích lũy
         if blank_count > 0:
             if buffer and not _buffer_ends_complete(buffer):
                 pass  # Cross-page/block break giữa câu → nối tiếp
@@ -365,7 +627,6 @@ def _reflow_paragraphs(text: str) -> str:
                 result.append("")
             blank_count = 0
 
-        # Heading → đứng riêng
         if _is_heading_line(stripped):
             if buffer:
                 result.append(buffer)
@@ -373,7 +634,6 @@ def _reflow_paragraphs(text: str) -> str:
             result.append(stripped)
             continue
 
-        # List item → bắt đầu block mới
         if _is_section_number(stripped):
             if buffer:
                 result.append(buffer)
@@ -381,13 +641,11 @@ def _reflow_paragraphs(text: str) -> str:
             buffer = stripped
             continue
 
-        # Nối dòng thường
         if buffer:
             buffer += " " + stripped
         else:
             buffer = stripped
 
-        # Kết thúc câu → flush
         if _buffer_ends_complete(buffer):
             result.append(buffer)
             buffer = ""
@@ -411,29 +669,17 @@ def clean_text(pages_text: list[str]) -> str:
 
     for page in pages_text:
         lines = page.strip().split("\n")
-
-        # Xóa dòng chỉ là số trang
         lines = [l for l in lines if not _is_page_number(l)]
-
         text = "\n".join(lines)
-
-        # Smart de-hyphenation: chỉ nối nếu từ tiếp theo viết thường
-        # "thông-\nbáo" → "thôngbáo" nhưng "Bắc-\nKinh" giữ nguyên
         text = re.sub(r"(\w+)-\n([a-zà-ỹ])", r"\1\2", text)
-
-        # Xóa ký tự control (giữ newline, tab, space)
         text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", text)
-
-        # Chuẩn hóa khoảng trắng
         text = re.sub(r"\n{3,}", "\n\n", text)
         text = re.sub(r"[ \t]+", " ", text)
         text = "\n".join(l.strip() for l in text.split("\n"))
-
         text = text.strip()
         if text:
             cleaned_pages.append(text)
 
-    # Ghép tất cả trang, sau đó reflow paragraph
     merged = "\n\n".join(cleaned_pages)
     return _reflow_paragraphs(merged)
 
@@ -448,7 +694,7 @@ def split_into_chunks(text: str, chunk_size: int = DEFAULT_CHUNK_SIZE) -> list[s
     Chia text thành đoạn ≤ chunk_size ký tự.
 
     Quy tắc ưu tiên cắt:
-    1. Double newline (\n\n) — ranh giới đoạn văn.
+    1. Double newline (\\n\\n) — ranh giới đoạn văn.
     2. Dấu chấm câu thật (tránh viết tắt Tp., Mr., Dr..).
     3. Single newline.
     4. Hard-cut tại chunk_size.
@@ -469,26 +715,21 @@ def split_into_chunks(text: str, chunk_size: int = DEFAULT_CHUNK_SIZE) -> list[s
         segment = remaining[:chunk_size]
         best_cut = -1
 
-        # Ưu tiên 1: Cắt tại paragraph boundary (\n\n)
         para_cut = segment.rfind("\n\n")
-        if para_cut > chunk_size * 0.3:  # Chỉ dùng nếu ≥ 30% chunk
+        if para_cut > chunk_size * 0.3:
             best_cut = para_cut + 2
 
-        # Ưu tiên 2: Cắt tại dấu câu thật (tránh viết tắt)
         if best_cut <= 0:
-            # Tìm tất cả vị trí kết thúc câu thật trong segment
             for m in _SENTENCE_END_RE.finditer(segment):
                 pos = m.end()
                 if pos > best_cut:
                     best_cut = pos
 
-        # Ưu tiên 3: Cắt tại newline đơn
         if best_cut <= 0:
             nl_cut = segment.rfind("\n")
             if nl_cut > 0:
                 best_cut = nl_cut + 1
 
-        # Fallback: hard-cut
         if best_cut <= 0:
             best_cut = chunk_size
 
@@ -508,28 +749,25 @@ def split_into_chunks(text: str, chunk_size: int = DEFAULT_CHUNK_SIZE) -> list[s
 async def synthesize_chunk_with_retry(
     text: str,
     output_path: str,
-    voice: str,
-    rate: str,
+    provider: TTSProvider,
+    tts_config: dict,
     max_retries: int = MAX_RETRIES,
 ) -> tuple[bool, str]:
     """
-    Chuyển 1 chunk text → MP3 với cơ chế retry.
+    Chuyển 1 chunk text → MP3 với cơ chế retry (provider-agnostic).
 
     Returns:
         (success: bool, message: str)
     """
     for attempt in range(1, max_retries + 1):
         try:
-            # Đảm bảo thư mục output tồn tại (phòng trường hợp user xóa sau khi upload)
             os.makedirs(os.path.dirname(output_path), exist_ok=True)
-            
-            communicate = edge_tts.Communicate(text, voice, rate=rate)
-            await communicate.save(output_path)
-            # Kiểm tra file thực sự được ghi
-            if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+
+            success, msg = await provider.generate_audio(text, output_path, tts_config)
+            if success:
                 return True, f"✅ OK (attempt {attempt})"
-            else:
-                raise RuntimeError("File rỗng sau khi save")
+            # Provider trả về failure message
+            raise RuntimeError(msg)
         except Exception as e:
             msg = f"Attempt {attempt}/{max_retries} failed: {e}"
             if attempt < max_retries:
@@ -541,8 +779,8 @@ async def synthesize_chunk_with_retry(
 
 def run_synthesis_pipeline(
     chunks: list[str],
-    voice: str,
-    rate: str,
+    provider: TTSProvider,
+    tts_config: dict,
     output_folder: str,
     base_name: str,
     progress_bar,
@@ -568,8 +806,9 @@ def run_synthesis_pipeline(
     def append_log(msg: str):
         """Thêm 1 dòng log và cập nhật UI."""
         log_lines.append(msg)
-        # Hiển thị 20 dòng gần nhất
         log_container.code("\n".join(log_lines[-20:]), language=None)
+
+    append_log(f"🔧 Provider: {provider.name}")
 
     try:
         for i, chunk_text in enumerate(chunks):
@@ -589,10 +828,10 @@ def run_synthesis_pipeline(
                 progress_bar.progress(part_num / total)
                 continue
 
-            # ── Gọi TTS ──
-            status_text.text(f"🔊 Đang tạo phần {part_num}/{total}...")
+            # ── Gọi TTS (provider-agnostic) ──
+            status_text.text(f"🔊 [{provider.name}] Đang tạo phần {part_num}/{total}...")
             success, msg = loop.run_until_complete(
-                synthesize_chunk_with_retry(chunk_text, filepath, voice, rate)
+                synthesize_chunk_with_retry(chunk_text, filepath, provider, tts_config)
             )
 
             if success:
@@ -632,6 +871,21 @@ def format_rate(val: int) -> str:
     return f"+{val}%" if val >= 0 else f"{val}%"
 
 
+def _save_uploaded_json_to_temp(uploaded_file) -> str:
+    """
+    Lưu file JSON upload vào thư mục tạm.
+
+    Returns:
+        Đường dẫn tuyệt đối tới file tạm.
+    """
+    tmp_dir = os.path.join(tempfile.gettempdir(), "tts_credentials")
+    os.makedirs(tmp_dir, exist_ok=True)
+    tmp_path = os.path.join(tmp_dir, "google_credentials.json")
+    with open(tmp_path, "wb") as f:
+        f.write(uploaded_file.getvalue())
+    return tmp_path
+
+
 # ──────────────────────────────────────────────
 # STREAMLIT UI
 # ──────────────────────────────────────────────
@@ -647,33 +901,188 @@ def init_session_state():
         "processing_done": False,
         "stop_requested": False,
         "current_file_name": "",
+        # Provider-specific state
+        "google_credentials_path": "",
+        "openai_api_key": "",
     }
     for key, val in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = val
 
 
-def render_sidebar() -> tuple[str, str, int, int]:
-    """Render sidebar cấu hình. Trả về (voice_id, rate_str, chunk_size, margin_px)."""
+def render_sidebar() -> tuple[TTSProvider | None, dict, int, int]:
+    """
+    Render sidebar cấu hình với dynamic provider selection.
+
+    Returns:
+        (provider, tts_config, chunk_size, margin_px)
+        provider = None nếu credentials chưa được cung cấp.
+    """
+    provider: TTSProvider | None = None
+    tts_config: dict = {}
+
     with st.sidebar:
         st.header("⚙️ Cấu hình")
 
-        st.subheader("🎤 Giọng đọc")
-        voice_label = st.selectbox(
-            "Chọn giọng đọc",
-            list(VOICE_OPTIONS.keys()),
+        # ── Provider Selection ──
+        st.subheader("🌐 Nguồn giọng đọc")
+        selected_provider = st.selectbox(
+            "Chọn TTS Provider",
+            PROVIDER_LIST,
             index=0,
-            help="Giọng Việt Nam phù hợp cho sách tiếng Việt.",
+            help="Edge TTS miễn phí. Google Cloud và OpenAI cần API key/credentials.",
         )
-        voice_id = VOICE_OPTIONS[voice_label]
 
-        st.subheader("⏩ Tốc độ đọc")
-        rate_val = st.slider(
-            "Tốc độ (%)", -50, 50, 0, 5,
-            help="0% = bình thường.",
-        )
-        rate_str = format_rate(rate_val)
-        st.caption(f"Rate: `{rate_str}`")
+        st.divider()
+
+        # ═══════════════════════════════════════
+        # EDGE TTS — Giữ nguyên logic cũ
+        # ═══════════════════════════════════════
+        if selected_provider == PROVIDER_EDGE:
+            st.subheader("🎤 Giọng đọc (Edge TTS)")
+            voice_label = st.selectbox(
+                "Chọn giọng đọc",
+                list(EDGE_VOICE_OPTIONS.keys()),
+                index=0,
+                help="Giọng Việt Nam phù hợp cho sách tiếng Việt.",
+            )
+            voice_id = EDGE_VOICE_OPTIONS[voice_label]
+
+            st.subheader("⏩ Tốc độ đọc")
+            rate_val = st.slider(
+                "Tốc độ (%)", -50, 50, 0, 5,
+                help="0% = bình thường.",
+            )
+            rate_str = format_rate(rate_val)
+            st.caption(f"Rate: `{rate_str}`")
+
+            provider = EdgeTTSProvider()
+            tts_config = {"voice": voice_id, "rate": rate_str}
+
+        # ═══════════════════════════════════════
+        # GOOGLE CLOUD TTS
+        # ═══════════════════════════════════════
+        elif selected_provider == PROVIDER_GOOGLE:
+            st.subheader("🔑 Google Cloud Credentials")
+            uploaded_json = st.file_uploader(
+                "Upload Service Account JSON",
+                type=["json"],
+                help="File JSON key từ Google Cloud Console (IAM → Service Accounts).",
+                key="google_json_uploader",
+            )
+
+            if uploaded_json is not None:
+                try:
+                    # Validate JSON structure
+                    content = uploaded_json.getvalue()
+                    parsed = json.loads(content)
+                    if "type" not in parsed or parsed.get("type") != "service_account":
+                        st.error("❌ File JSON không phải Service Account key hợp lệ.")
+                    else:
+                        cred_path = _save_uploaded_json_to_temp(uploaded_json)
+                        st.session_state["google_credentials_path"] = cred_path
+                        st.success("✅ Credentials đã được tải lên.")
+                except json.JSONDecodeError:
+                    st.error("❌ File không phải JSON hợp lệ.")
+
+            st.subheader("🎤 Giọng đọc (Google Cloud)")
+            google_voice_label = st.selectbox(
+                "Chọn giọng Google",
+                list(GOOGLE_VOICE_OPTIONS.keys()),
+                index=0,
+            )
+            google_voice_info = GOOGLE_VOICE_OPTIONS[google_voice_label]
+
+            st.subheader("⏩ Tốc độ đọc")
+            speaking_rate = st.slider(
+                "Speaking Rate", 0.5, 2.0, 1.0, 0.1,
+                help="1.0 = bình thường. 0.5 = chậm. 2.0 = nhanh.",
+            )
+
+            cred_path = st.session_state.get("google_credentials_path", "")
+            if cred_path and os.path.exists(cred_path):
+                quota_mgr = QuotaManager()
+                provider = GoogleCloudTTSProvider(
+                    credentials_path=cred_path, quota_manager=quota_mgr
+                )
+                tts_config = {
+                    "voice_info": google_voice_info,
+                    "speaking_rate": speaking_rate,
+                }
+
+                # ── Quota display ──
+                st.divider()
+                st.subheader("📊 Hạn ngạch miễn phí")
+                used = quota_mgr.used_chars
+                limit = quota_mgr.limit
+                pct = quota_mgr.usage_ratio
+                st.progress(pct)
+                if pct >= 1.0:
+                    st.error(f"🚫 Đã hết hạn mức: **{used:,}** / {limit:,} ký tự")
+                elif pct >= 0.8:
+                    st.warning(
+                        f"⚠️ Sắp hết: **{used:,}** / {limit:,} ký tự ({pct:.0%}) "
+                        f"· Còn lại: **{quota_mgr.remaining:,}**"
+                    )
+                else:
+                    st.caption(
+                        f"Đã dùng: **{used:,}** / {limit:,} ký tự ({pct:.0%}) "
+                        f"· Còn lại: **{quota_mgr.remaining:,}**"
+                    )
+            else:
+                st.warning("⚠️ Hãy upload file JSON credentials để sử dụng Google Cloud TTS.")
+
+        # ═══════════════════════════════════════
+        # OPENAI TTS
+        # ═══════════════════════════════════════
+        elif selected_provider == PROVIDER_OPENAI:
+            st.subheader("🔑 OpenAI API Key")
+            api_key = st.text_input(
+                "Nhập API Key",
+                type="password",
+                placeholder="sk-...",
+                help="API Key từ https://platform.openai.com/api-keys",
+                key="openai_key_input",
+            )
+
+            if api_key:
+                st.session_state["openai_api_key"] = api_key
+                st.success("✅ API Key đã nhập.")
+
+            st.subheader("🤖 Model")
+            openai_model = st.selectbox(
+                "Chọn model",
+                OPENAI_TTS_MODELS,
+                index=0,
+                help="tts-1 = nhanh, rẻ hơn. tts-1-hd = chất lượng cao hơn.",
+            )
+
+            st.subheader("🎤 Giọng đọc (OpenAI)")
+            openai_voice = st.selectbox(
+                "Chọn giọng OpenAI",
+                OPENAI_VOICE_OPTIONS,
+                index=0,
+            )
+
+            st.subheader("⏩ Tốc độ đọc")
+            openai_speed = st.slider(
+                "Speed", 0.25, 4.0, 1.0, 0.25,
+                help="1.0 = bình thường. Khoảng hỗ trợ: 0.25 – 4.0.",
+            )
+
+            effective_key = st.session_state.get("openai_api_key", "") or api_key
+            if effective_key:
+                provider = OpenAITTSProvider(api_key=effective_key)
+                tts_config = {
+                    "model": openai_model,
+                    "voice": openai_voice,
+                    "speed": openai_speed,
+                }
+            else:
+                st.warning("⚠️ Hãy nhập OpenAI API Key để sử dụng.")
+
+        # ── Common settings ──
+        st.divider()
 
         st.subheader("✂️ Chunk size")
         chunk_size = st.slider(
@@ -688,9 +1097,10 @@ def render_sidebar() -> tuple[str, str, int, int]:
         )
 
         st.divider()
-        st.caption("🛠️ Powered by pdfplumber + Edge TTS")
+        provider_label = selected_provider.split(" (")[0] if provider else "—"
+        st.caption(f"🛠️ Powered by pdfplumber + {provider_label}")
 
-    return voice_id, rate_str, chunk_size, margin_px
+    return provider, tts_config, chunk_size, margin_px
 
 
 def render_step1_upload():
@@ -706,13 +1116,11 @@ def render_step1_upload():
 
     if uploaded is None:
         st.info("👆 Upload file để bắt đầu.")
-        # Reset state khi không có file
         st.session_state["full_text"] = ""
         st.session_state["chunks"] = []
         st.session_state["current_file_name"] = ""
         return False
 
-    # Nếu file mới khác file cũ → reset state
     if uploaded.name != st.session_state.get("current_file_name", ""):
         st.session_state["current_file_name"] = uploaded.name
         st.session_state["full_text"] = ""
@@ -720,15 +1128,13 @@ def render_step1_upload():
         st.session_state["processing_done"] = False
         st.session_state["stop_requested"] = False
 
-    # Extract (cached)
     if not st.session_state["full_text"]:
         file_ext = os.path.splitext(uploaded.name)[1].lower()
         margin_px = st.session_state.get("margin_px", DEFAULT_MARGIN_PX)
-        
+
         with st.spinner("📖 Đang trích xuất văn bản..."):
             file_bytes = uploaded.read()
-            
-            # Dispatcher: chọn hàm trích xuất theo loại file
+
             if file_ext == ".pdf":
                 pages = extract_text_with_cache(
                     file_bytes, uploaded.name, margin_px, margin_px,
@@ -754,7 +1160,6 @@ def render_step1_upload():
         st.session_state["base_name"] = os.path.splitext(uploaded.name)[0]
         st.session_state["output_folder"] = get_output_folder(uploaded.name)
 
-    # Thống kê
     text = st.session_state["full_text"]
     st.success(
         f"✅ Đã trích xuất: **{len(text):,}** ký tự · "
@@ -771,7 +1176,6 @@ def render_step2_editor(chunk_size: int):
     if not text:
         return
 
-    # Chia chunks (hoặc dùng chunks đã lưu nếu chunk_size không đổi)
     chunks = split_into_chunks(text, chunk_size)
     st.session_state["chunks"] = chunks
     total_chunks = len(chunks)
@@ -781,7 +1185,6 @@ def render_step2_editor(chunk_size: int):
     if total_chunks == 0:
         return
 
-    # ── Pagination controls ──
     col_nav1, col_nav2 = st.columns([1, 3])
     with col_nav1:
         page = st.number_input(
@@ -795,7 +1198,6 @@ def render_step2_editor(chunk_size: int):
     with col_nav2:
         st.caption(f"Phần {page}/{total_chunks} · {len(chunks[page - 1]):,} ký tự")
 
-    # ── Text editor cho chunk hiện tại ──
     chunk_idx = page - 1
     edited = st.text_area(
         f"Nội dung phần {page}",
@@ -805,15 +1207,12 @@ def render_step2_editor(chunk_size: int):
         label_visibility="collapsed",
     )
 
-    # ── Nút Save ──
     if st.button("💾 Lưu chỉnh sửa", key="save_edits"):
         if edited != chunks[chunk_idx]:
             chunks[chunk_idx] = edited
             st.session_state["chunks"] = chunks
-            # Rebuild full_text từ chunks đã sửa
             st.session_state["full_text"] = "\n\n".join(chunks)
             st.success(f"✅ Đã lưu chỉnh sửa phần {page}.")
-            # Xóa file MP3 cũ của chunk này (vì nội dung đã thay đổi)
             old_mp3 = chunk_filepath(
                 st.session_state["output_folder"],
                 st.session_state["base_name"],
@@ -826,8 +1225,8 @@ def render_step2_editor(chunk_size: int):
             st.info("ℹ️ Không có thay đổi.")
 
 
-def render_step4_processing(voice_id: str, rate_str: str):
-    """Step 4: TTS Processing với Progress, Resume, Stop."""
+def render_step4_processing(provider: TTSProvider | None, tts_config: dict):
+    """Step 3: TTS Processing với Progress, Resume, Stop."""
     st.markdown("### 🔊 Bước 3 — Tạo Audio")
 
     chunks = st.session_state.get("chunks", [])
@@ -835,11 +1234,15 @@ def render_step4_processing(voice_id: str, rate_str: str):
         st.warning("⚠️ Chưa có chunks. Hãy hoàn thành Bước 1 & 2.")
         return
 
+    # Kiểm tra provider sẵn sàng
+    if provider is None:
+        st.error("❌ Chưa cấu hình TTS Provider. Hãy kiểm tra sidebar.")
+        return
+
     output_folder = st.session_state["output_folder"]
     base_name = st.session_state["base_name"]
     total = len(chunks)
 
-    # Đếm file đã có
     existing = list_existing_mp3s(output_folder)
     existing_count = len(existing)
 
@@ -850,7 +1253,6 @@ def render_step4_processing(voice_id: str, rate_str: str):
             f"Các phần này sẽ được **bỏ qua** khi tạo audio."
         )
 
-    # ── Buttons: Generate / Stop ──
     col_btn1, col_btn2 = st.columns(2)
     with col_btn1:
         generate = st.button(
@@ -875,8 +1277,8 @@ def render_step4_processing(voice_id: str, rate_str: str):
 
         completed = run_synthesis_pipeline(
             chunks=chunks,
-            voice=voice_id,
-            rate=rate_str,
+            provider=provider,
+            tts_config=tts_config,
             output_folder=output_folder,
             base_name=base_name,
             progress_bar=progress_bar,
@@ -897,7 +1299,7 @@ def render_step4_processing(voice_id: str, rate_str: str):
 
 
 def render_step5_download():
-    """Step 5: Download Zone — luôn hiển thị nếu có ≥ 1 file MP3."""
+    """Step 4: Download Zone — luôn hiển thị nếu có ≥ 1 file MP3."""
     st.markdown("### 📥 Bước 4 — Tải về")
 
     output_folder = st.session_state.get("output_folder", "")
@@ -917,7 +1319,6 @@ def render_step5_download():
     else:
         st.success(f"✅ Đã hoàn thành tất cả **{done}/{total_chunks}** phần!")
 
-    # ── Audio players (collapsed, chỉ load khi mở) ──
     st.markdown("##### 🎵 Nghe thử")
     for mp3_path in mp3_files:
         name = os.path.basename(mp3_path)
@@ -933,7 +1334,6 @@ def render_step5_download():
                 key=f"dl_{name}",
             )
 
-    # ── ZIP download (luôn khả dụng) ──
     st.markdown("##### 📦 Tải tất cả (ZIP)")
     zip_bytes = create_zip_from_files(mp3_files)
     base = st.session_state.get("base_name", "audiobook")
@@ -971,7 +1371,7 @@ def main():
 
     st.title("📖 AI Audio Book Converter")
     st.markdown(
-        "Chuyển đổi **PDF** → **MP3 Audiobook** với giọng AI chất lượng cao. "
+        "Chuyển đổi **PDF / DOCX / TXT** → **MP3 Audiobook** với giọng AI chất lượng cao. "
         "Hỗ trợ **Resume**, **Pause**, và **Partial Download**."
     )
     st.divider()
@@ -979,8 +1379,8 @@ def main():
     # Khởi tạo state
     init_session_state()
 
-    # Sidebar
-    voice_id, rate_str, chunk_size, margin_px = render_sidebar()
+    # Sidebar — Dynamic provider selection
+    provider, tts_config, chunk_size, margin_px = render_sidebar()
     st.session_state["margin_px"] = margin_px
 
     # ── Step 1: Upload & Extract ──
@@ -995,12 +1395,12 @@ def main():
 
     st.divider()
 
-    # ── Step 3 (previously 4): Processing ──
-    render_step4_processing(voice_id, rate_str)
+    # ── Step 3: Processing ──
+    render_step4_processing(provider, tts_config)
 
     st.divider()
 
-    # ── Step 4 (previously 5): Download ──
+    # ── Step 4: Download ──
     render_step5_download()
 
 

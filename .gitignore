@@ -27,6 +27,8 @@ output/
 # Input text/PDF files (optional, depending on if you want to track them)
 *.pdf
 *.txt
+*.json
+
 
 # Streamlit
 .streamlit/
