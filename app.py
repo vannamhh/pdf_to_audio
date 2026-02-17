@@ -24,6 +24,7 @@ import zipfile
 import edge_tts
 import pdfplumber
 import streamlit as st
+from docx import Document
 
 # ──────────────────────────────────────────────
 # CONSTANTS
@@ -108,8 +109,8 @@ def extract_text_with_cache(
     """
     Trích xuất text từ PDF bằng pdfplumber với crop bounding-box.
 
-    Sử dụng page.crop() để loại bỏ header/footer theo tọa độ,
-    giữ nguyên khoảng trắng giữa các từ tiếng Việt.
+    Fault-tolerant: Bỏ qua các trang lỗi (ảnh scan, kích thước lạ) thay vì crash.
+    Fallback: Nếu margin quá lớn, trích xuất toàn bộ trang thay vì bỏ qua.
 
     Args:
         file_bytes: Nội dung file PDF (bytes).
@@ -121,26 +122,125 @@ def extract_text_with_cache(
         Danh sách text từng trang (đã loại header/footer).
     """
     pages_text: list[str] = []
+    total_pages = 0
+    skipped_pages = 0
+
     try:
         with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
-            for page in pdf.pages:
-                # An toàn: bỏ qua trang nếu margin lớn hơn trang
-                if margin_top + margin_bottom >= page.height:
+            total_pages = len(pdf.pages)
+            
+            for page_num, page in enumerate(pdf.pages, start=1):
+                try:
+                    # Kiểm tra margin có vượt quá kích thước trang không
+                    use_crop = margin_top + margin_bottom < page.height
+                    
+                    if use_crop:
+                        # Cắt bỏ header/footer theo margin
+                        bbox = (
+                            0,                                # x0 (left)
+                            margin_top,                       # y0 (top, cắt header)
+                            page.width,                       # x1 (right)
+                            page.height - margin_bottom,      # y1 (bottom, cắt footer)
+                        )
+                        cropped = page.crop(bbox)
+                        text = cropped.extract_text()
+                    else:
+                        # Fallback: margin quá lớn → lấy toàn bộ trang
+                        text = page.extract_text()
+                    
+                    # Xử lý None/empty text
+                    if text and text.strip():
+                        pages_text.append(text)
+                    else:
+                        # Trang không có text (có thể là ảnh scan)
+                        skipped_pages += 1
+                        
+                except Exception as e:
+                    # Lỗi trang cụ thể → bỏ qua, không crash toàn bộ
+                    skipped_pages += 1
+                    # Log cảnh báo nhưng không hiển thị error popup
+                    print(f"⚠️ Trang {page_num}/{total_pages}: Bỏ qua do lỗi - {e}")
                     continue
-                # Crop: bỏ margin_top px trên và margin_bottom px dưới
-                bbox = (
-                    0,                                # x0 (left)
-                    margin_top,                       # y0 (top, cắt header)
-                    page.width,                       # x1 (right)
-                    page.height - margin_bottom,      # y1 (bottom, cắt footer)
+            
+            # Thông báo tổng kết nếu có trang bị skip
+            if skipped_pages > 0:
+                st.warning(
+                    f"ℹ️ Đã bỏ qua {skipped_pages}/{total_pages} trang "
+                    f"(có thể là ảnh scan hoặc không có text)"
                 )
-                cropped = page.crop(bbox)
-                text = cropped.extract_text()
-                if text:
-                    pages_text.append(text)
+                
     except Exception as e:
+        # Lỗi nghiêm trọng (file corrupt, không mở được)
         st.error(f"❌ Lỗi khi đọc PDF **{file_name}**: `{e}`")
+        return []
+    
     return pages_text
+
+
+@st.cache_data(show_spinner=False)
+def extract_docx(file_bytes: bytes, file_name: str) -> list[str]:
+    """
+    Trích xuất text từ file Microsoft Word (.docx).
+
+    Args:
+        file_bytes: Nội dung file DOCX (bytes).
+        file_name: Tên file gốc.
+
+    Returns:
+        Danh sách đoạn văn (paragraphs).
+    """
+    paragraphs_list: list[str] = []
+    try:
+        doc = Document(io.BytesIO(file_bytes))
+        for para in doc.paragraphs:
+            text = para.text.strip()
+            if text:
+                paragraphs_list.append(text)
+        
+        if not paragraphs_list:
+            st.warning("⚠️ File DOCX không chứa văn bản.")
+    except Exception as e:
+        st.error(f"❌ Lỗi khi đọc DOCX **{file_name}**: `{e}`")
+    
+    return paragraphs_list
+
+
+@st.cache_data(show_spinner=False)
+def extract_text_file(file_bytes: bytes, file_name: str) -> list[str]:
+    """
+    Trích xuất text từ file văn bản thuần (.txt, .md).
+
+    Args:
+        file_bytes: Nội dung file text (bytes).
+        file_name: Tên file gốc.
+
+    Returns:
+        Danh sách đoạn văn (split by \n\n).
+    """
+    paragraphs_list: list[str] = []
+    try:
+        # Thử decode UTF-8 (tiêng Việt)
+        text = file_bytes.decode('utf-8')
+    except UnicodeDecodeError:
+        try:
+            # Fallback: Windows-1252 hoặc Latin-1
+            text = file_bytes.decode('latin-1')
+            st.warning("⚠️ File không phải UTF-8, dùng Latin-1 encoding.")
+        except Exception as e:
+            st.error(f"❌ Không thể decode file **{file_name}**: `{e}`")
+            return []
+    
+    # Tách theo đoạn văn (double newline)
+    paragraphs = text.split('\n\n')
+    for para in paragraphs:
+        cleaned = para.strip()
+        if cleaned:
+            paragraphs_list.append(cleaned)
+    
+    if not paragraphs_list:
+        st.warning("⚠️ File text trống hoặc không có nội dung.")
+    
+    return paragraphs_list
 
 
 # ──────────────────────────────────────────────
@@ -420,6 +520,9 @@ async def synthesize_chunk_with_retry(
     """
     for attempt in range(1, max_retries + 1):
         try:
+            # Đảm bảo thư mục output tồn tại (phòng trường hợp user xóa sau khi upload)
+            os.makedirs(os.path.dirname(output_path), exist_ok=True)
+            
             communicate = edge_tts.Communicate(text, voice, rate=rate)
             await communicate.save(output_path)
             # Kiểm tra file thực sự được ghi
@@ -591,18 +694,18 @@ def render_sidebar() -> tuple[str, str, int, int]:
 
 
 def render_step1_upload():
-    """Step 1: Upload & Extract PDF."""
-    st.markdown("### 📤 Bước 1 — Upload PDF")
+    """Step 1: Upload & Extract Document."""
+    st.markdown("### 📤 Bước 1 — Upload Tài liệu")
 
     uploaded = st.file_uploader(
-        "Chọn file PDF",
-        type=["pdf"],
+        "Chọn file PDF, DOCX, TXT, hoặc MD",
+        type=["pdf", "docx", "txt", "md"],
         accept_multiple_files=False,
-        help="Upload 1 file PDF. Hỗ trợ file lớn.",
+        help="Hỗ trợ PDF, Word, Text, và Markdown.",
     )
 
     if uploaded is None:
-        st.info("👆 Upload 1 file PDF để bắt đầu.")
+        st.info("👆 Upload file để bắt đầu.")
         # Reset state khi không có file
         st.session_state["full_text"] = ""
         st.session_state["chunks"] = []
@@ -617,14 +720,26 @@ def render_step1_upload():
         st.session_state["processing_done"] = False
         st.session_state["stop_requested"] = False
 
-    # Extract (cached) — margin_px từ session state
+    # Extract (cached)
     if not st.session_state["full_text"]:
+        file_ext = os.path.splitext(uploaded.name)[1].lower()
         margin_px = st.session_state.get("margin_px", DEFAULT_MARGIN_PX)
+        
         with st.spinner("📖 Đang trích xuất văn bản..."):
             file_bytes = uploaded.read()
-            pages = extract_text_with_cache(
-                file_bytes, uploaded.name, margin_px, margin_px,
-            )
+            
+            # Dispatcher: chọn hàm trích xuất theo loại file
+            if file_ext == ".pdf":
+                pages = extract_text_with_cache(
+                    file_bytes, uploaded.name, margin_px, margin_px,
+                )
+            elif file_ext == ".docx":
+                pages = extract_docx(file_bytes, uploaded.name)
+            elif file_ext in [".txt", ".md"]:
+                pages = extract_text_file(file_bytes, uploaded.name)
+            else:
+                st.error(f"❌ Định dạng file không được hỗ trợ: {file_ext}")
+                return False
 
         if not pages:
             st.warning("⚠️ Không trích xuất được văn bản từ file này.")
